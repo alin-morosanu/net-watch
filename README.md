@@ -22,8 +22,9 @@ Every logged drop also says who probably caused it:
 
 ```
 netwatch.py           # the main script
+config.py             # settings you can edit (targets, timing, thresholds, version)
 tests.py              # pytest tests (no real network needed)
-netwatch.service      # systemd unit for running it on a Linux server or Raspberry Pi
+net-watch.service     # systemd unit for running it on a Linux server or Raspberry Pi
 net_outages.csv       # created automatically when the first drop is logged
 ```
 
@@ -80,7 +81,7 @@ $ python3 netwatch.py --hourly
 
 Drops by hour of day (local time):
 
-00:00  ##                              0.4 min  (1 drops)
+00:00  ##                              0.4 min  (1 drop)
 ...
 20:00  ##############################  8.1 min  (5 drops)
 21:00  ##################              4.3 min  (3 drops)
@@ -88,6 +89,58 @@ Drops by hour of day (local time):
 ```
 
 If it is always bad at the same time of day, that chart makes the pattern very obvious.
+
+### Daily chart
+
+```
+$ python3 netwatch.py --daily
+
+Drops by day (local time):
+
+2026-06-10  ##############################    5.9 min  (2 drops)
+2026-06-20  ##########                        2.0 min  (1 drop)
+```
+
+Good for showing "it failed on N separate days". A drop is counted once on the
+day it began; its downtime is split across every day it spanned.
+
+### Hand-to-your-ISP report
+
+A single, self-contained summary you can read out, paste into a letter, or save
+to a file. Pair it with the date flags below to scope it to your complaint
+period.
+
+```
+$ python3 netwatch.py --report --since 2026-06-01 --until 2026-06-30
+
+net-watch outage report
+Period:           2026-06-01 to 2026-06-30
+Drops logged:     3
+Total time down:  7.9 min (472s)
+Likely ISP fault: 2 of 3 (67%)
+Longest drop:     335s at 2026-06-10 20:03
+
+Worst 3 outages:
+  2026-06-10 20:03     335s  ISP / upstream
+  2026-06-20 09:00     120s  ISP / upstream
+  2026-06-10 22:11      17s  local network
+```
+
+Save it to a file to attach to an email:
+
+```bash
+python3 netwatch.py --report --last 30d > complaint.txt
+```
+
+### Narrowing a report to a period
+
+All four reports accept the same date filters:
+
+```bash
+python3 netwatch.py --summary --last 7d          # the last 7 days
+python3 netwatch.py --hourly --since 2026-06-01  # from a date onward
+python3 netwatch.py --daily --since 2026-06-01 --until 2026-06-30
+```
 
 ---
 
@@ -100,6 +153,11 @@ If it is always bad at the same time of day, that chart makes the pattern very o
 | `--logfile PATH` | `net_outages.csv` | Where to write the CSV log. Use an absolute path when running as a service. |
 | `--summary` | — | Print totals and exit. |
 | `--hourly` | — | Print the hour-by-hour chart and exit. |
+| `--daily` | — | Print the day-by-day chart and exit. |
+| `--report` | — | Print a hand-to-your-ISP summary and exit. |
+| `--since DATE` | — | Reports only: include drops on or after `YYYY-MM-DD`. |
+| `--until DATE` | — | Reports only: include drops on or before `YYYY-MM-DD` (inclusive). |
+| `--last WINDOW` | — | Reports only: include drops from the last `7d` (days) or `24h` (hours). |
 | `--version` | — | Print the version and exit. |
 
 Example — check every 3 seconds, need 3 failures before believing a drop:
@@ -107,6 +165,25 @@ Example — check every 3 seconds, need 3 failures before believing a drop:
 ```bash
 python3 netwatch.py --interval 3 --fails 3
 ```
+
+---
+
+## Settings
+
+The defaults live in `config.py`. Edit that one file to change them for good:
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `TARGETS` | Cloudflare + Google DNS | The `(host, port)` pairs probed to decide if the internet is up. |
+| `CHECK_INTERVAL` | `5` | Seconds between checks. |
+| `SOCKET_TIMEOUT` | `2.0` | Seconds to wait for each target. |
+| `FAIL_THRESHOLD` | `2` | Failures in a row before a real drop. |
+| `RECOVER_THRESHOLD` | `1` | Successes in a row before recovery. |
+| `LOG_FILE` | `net_outages.csv` | Default CSV path. |
+| `VERSION` | — | The release version. |
+
+The `--interval`, `--fails` and `--logfile` flags override the matching
+settings for a single run, so you don't have to edit the file for one-offs.
 
 ---
 
@@ -146,25 +223,25 @@ The Pi is the best place to run this. It is on all day, uses almost no power, an
 
 ```bash
 mkdir -p /home/pi/net-watch
-cp netwatch.py netwatch.service /home/pi/net-watch/
+cp netwatch.py config.py net-watch.service /home/pi/net-watch/
 ```
 
 **Install as a service** (starts automatically on boot, restarts if it crashes):
 
 ```bash
-# edit netwatch.service first if your username is not "pi"
-sudo cp /home/pi/net-watch/netwatch.service /etc/systemd/system/
+# edit net-watch.service first if your username is not "pi"
+sudo cp /home/pi/net-watch/net-watch.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now netwatch
+sudo systemctl enable --now net-watch
 ```
 
 **Useful commands:**
 
 ```bash
-sudo systemctl status netwatch      # is it running?
-journalctl -u netwatch -f           # watch the live output
-sudo systemctl stop netwatch        # stop it
-sudo systemctl disable netwatch     # stop it starting on boot
+sudo systemctl status net-watch     # is it running?
+journalctl -u net-watch -f          # watch the live output
+sudo systemctl stop net-watch       # stop it
+sudo systemctl disable net-watch    # stop it starting on boot
 ```
 
 The CSV is saved in `/home/pi/net-watch/net_outages.csv`.
@@ -199,7 +276,7 @@ The code is split into small parts that each do one job. This makes it easy to c
 | `SocketReachability` / `RouterReachability` | Strategy | "Can I reach X?" One class per check. |
 | `DropDetector` | State machine | Turns up/down samples into real drops. Handles debounce. |
 | `CsvOutageLog` / `InMemoryOutageLog` | Repository | Where drops are saved. CSV for real use, memory for tests. |
-| `SummaryReporter` / `HourlyReporter` | Strategy + Open/Closed | Each report is its own class. Add a new one without touching the rest. |
+| `SummaryReporter` / `HourlyReporter` / `DailyReporter` / `ReportReporter` | Strategy + Open/Closed | Each report is its own class. Add a new one without touching the rest. |
 | `Monitor` | Orchestrator | Ties everything together. Depends only on the interfaces, not the real code. |
 | `main()` | Composition root | The one place that builds real objects and wires them up. |
 
@@ -207,19 +284,27 @@ The code is split into small parts that each do one job. This makes it easy to c
 
 ## Talking to your provider
 
-Collect at least a week of data, ideally two. Then run both reports and write down:
+Collect at least a week of data, ideally two. Then run the report for that period:
+
+```bash
+python3 netwatch.py --report --last 14d > complaint.txt
+```
+
+It gives you the numbers providers take seriously:
 
 - Total number of drops
 - Total minutes of downtime
 - How many drops were "ISP / upstream" (the important number)
-- The worst hours from the hourly chart
+- The worst individual outages, with timestamps
 
-That is a solid, factual complaint. Providers take numbers more seriously than descriptions.
+Add the hourly or daily chart if a time-of-day or day-by-day pattern helps your
+case. That is a solid, factual complaint — numbers carry more weight than
+descriptions.
 
 ---
 
 ## Requirements
 
-- Python 3.8 or newer
+- Python 3.9 or newer
 - No third-party packages needed
 - `pytest` only if you want to run the tests

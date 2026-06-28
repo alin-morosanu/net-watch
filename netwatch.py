@@ -35,20 +35,25 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
 from typing import Protocol
 
-__version__ = "0.1.0"
+# Tunable defaults live in config.py — one place to edit the values that
+# change from time to time. The command-line flags (--interval, --fails,
+# --logfile) still override the matching settings at runtime.
+from config import (
+    CHECK_INTERVAL,
+    FAIL_THRESHOLD,
+    LOG_FILE,
+    RECOVER_THRESHOLD,
+    SOCKET_TIMEOUT,
+    TARGETS,
+    VERSION,
+)
 
-# --- settings you can change ---
-TARGETS: list[tuple[str, int]] = [("1.1.1.1", 53), ("8.8.8.8", 53)]
-CHECK_INTERVAL = 5  # seconds between checks
-SOCKET_TIMEOUT = 2.0  # seconds to wait for each target
-FAIL_THRESHOLD = 2  # failures in a row before we believe it is a real drop
-RECOVER_THRESHOLD = 1  # successes in a row before we call it back
-LOG_FILE = Path("net_outages.csv")
+__version__ = VERSION
 
 _OS = platform.system()  # "Linux", "Darwin" (Mac), or "Windows"
 
@@ -357,6 +362,11 @@ class InMemoryOutageLog:
 # =====================================================================
 #  Reporters — add new ones without touching anything else
 # =====================================================================
+def _drops_label(n: int) -> str:
+    """'1 drop' / '2 drops' — gets the singular right."""
+    return f"{n} drop" if n == 1 else f"{n} drops"
+
+
 class SummaryReporter:
     def report(self, outages: list[Outage]) -> None:
         if not outages:
@@ -404,8 +414,95 @@ class HourlyReporter:
         for hour in range(24):
             bar = "#" * int((secs[hour] / worst) * self.BAR_WIDTH)
             print(
-                f"{hour:02d}:00  {bar:<{self.BAR_WIDTH}}  {secs[hour] / 60:5.1f} min  ({count[hour]} drops)"
+                f"{hour:02d}:00  {bar:<{self.BAR_WIDTH}}  {secs[hour] / 60:5.1f} min  ({_drops_label(count[hour])})"
             )
+
+
+class DailyReporter:
+    """Drops grouped by calendar day, as a little text chart.
+
+    Same convention as the hourly chart: a drop is counted once on the day it
+    began, but its seconds are split across every day it spanned (so an
+    outage over midnight shows downtime on both days). O(n) over the drops."""
+
+    BAR_WIDTH = 30
+
+    def report(self, outages: list[Outage]) -> None:
+        if not outages:
+            print("No drops logged yet.")
+            return
+        secs: dict[date, float] = {}
+        count: dict[date, int] = {}
+        for o in outages:
+            count[o.start.date()] = count.get(o.start.date(), 0) + 1
+            current = o.start
+            while current < o.end:
+                next_midnight = current.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ) + timedelta(days=1)
+                segment_end = min(next_midnight, o.end)
+                day = current.date()
+                secs[day] = secs.get(day, 0.0) + (segment_end - current).total_seconds()
+                current = segment_end
+        # `secs` is only empty if every outage had end <= start (e.g. a
+        # hand-edited CSV); `default` keeps the chart from crashing on `max`.
+        worst = max(secs.values(), default=0.0) or 1.0
+        print("Drops by day (local time):\n")
+        for day in sorted(secs):
+            bar = "#" * int((secs[day] / worst) * self.BAR_WIDTH)
+            print(
+                f"{day:%Y-%m-%d}  {bar:<{self.BAR_WIDTH}}  {secs[day] / 60:5.1f} min  ({_drops_label(count.get(day, 0))})"
+            )
+
+
+class ReportReporter:
+    """A single, self-contained summary you can hand to your ISP.
+
+    Plain text on stdout, so you can read it, paste it into a letter, or
+    redirect it to a file with '> complaint.txt'. The window it was asked for
+    is shown so the period is unambiguous, even when no drops fell inside it.
+    """
+
+    WORST_N = 5
+
+    def __init__(
+        self, since: datetime | None = None, until: datetime | None = None
+    ) -> None:
+        self._since = since
+        self._until = until  # exclusive upper bound, as resolved by the CLI
+
+    def _period(self, outages: list[Outage]) -> str:
+        start = self._since or (min(o.start for o in outages) if outages else None)
+        if self._until is not None:
+            end = self._until - timedelta(seconds=1)  # back to the inclusive day
+        elif outages:
+            end = max(o.end for o in outages)
+        else:
+            end = None
+        if start is None or end is None:
+            return "all time"
+        return f"{start:%Y-%m-%d} to {end:%Y-%m-%d}"
+
+    def report(self, outages: list[Outage]) -> None:
+        print("net-watch outage report")
+        print(f"Period:           {self._period(outages)}")
+        if not outages:
+            print("\nNo drops recorded in this period.")
+            return
+        total = sum(o.seconds for o in outages)
+        longest = max(outages, key=lambda o: o.seconds)
+        isp = sum(1 for o in outages if o.cause.startswith("ISP"))
+        pct = isp / len(outages) * 100
+        print(f"Drops logged:     {len(outages)}")
+        print(f"Total time down:  {total / 60:.1f} min ({total:.0f}s)")
+        print(f"Likely ISP fault: {isp} of {len(outages)} ({pct:.0f}%)")
+        print(
+            f"Longest drop:     {longest.seconds:.0f}s at {longest.start:%Y-%m-%d %H:%M}"
+        )
+        worst = sorted(outages, key=lambda o: o.seconds, reverse=True)[: self.WORST_N]
+        print(f"\nWorst {len(worst)} outages:")
+        for o in worst:
+            print(f"  {o.start:%Y-%m-%d %H:%M}  {o.seconds:6.0f}s  {o.cause}")
 
 
 # =====================================================================
@@ -538,15 +635,104 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def parse_date(value: str) -> datetime:
+    """A YYYY-MM-DD date as a local-aware datetime at midnight."""
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").astimezone()
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a date like 2026-06-01, got {value!r}"
+        )
+
+
+def parse_window(value: str) -> timedelta:
+    """A look-back window like '7d' (days) or '24h' (hours). A bare number is days."""
+    text = value.strip().lower()
+    unit = "d"
+    if text[-1:] in {"d", "h"}:
+        unit, text = text[-1], text[:-1]
+    try:
+        amount = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a window like 7d or 24h, got {value!r}"
+        )
+    if amount < 1:
+        raise argparse.ArgumentTypeError("window must be at least 1")
+    return timedelta(days=amount) if unit == "d" else timedelta(hours=amount)
+
+
+def filter_by_range(
+    outages: list[Outage],
+    since: datetime | None,
+    until: datetime | None,
+) -> list[Outage]:
+    """Keep drops that began within [since, until). Each bound is aware or None."""
+    result = outages
+    if since is not None:
+        result = [o for o in result if o.start >= since]
+    if until is not None:
+        result = [o for o in result if o.start < until]
+    return result
+
+
+def _resolve_range(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> tuple[datetime | None, datetime | None]:
+    """Turn the CLI date flags into an aware, half-open [since, until) window."""
+    if args.last is not None:
+        if args.since is not None or args.until is not None:
+            parser.error("--last cannot be combined with --since/--until")
+        # Pin both ends so the report names the real window even with no drops.
+        current = now()
+        return current - args.last, current
+    since = args.since
+    # --until names an inclusive day; widen it to the start of the next day.
+    until = args.until + timedelta(days=1) if args.until is not None else None
+    if since is not None and until is not None and since >= until:
+        parser.error("--since must be on or before --until")
+    return since, until
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Log internet drops.")
     parser.add_argument(
         "--version", action="version", version=f"net-watch {__version__}"
     )
-    parser.add_argument("--summary", action="store_true", help="show totals and exit")
-    parser.add_argument(
-        "--hourly", action="store_true", help="show drops by hour and exit"
+
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--summary", action="store_true", help="show totals and exit")
+    modes.add_argument(
+        "--hourly", action="store_true", help="show drops by hour of day and exit"
     )
+    modes.add_argument(
+        "--daily", action="store_true", help="show drops by calendar day and exit"
+    )
+    modes.add_argument(
+        "--report",
+        action="store_true",
+        help="print a hand-to-your-ISP summary and exit",
+    )
+
+    parser.add_argument(
+        "--since",
+        type=parse_date,
+        metavar="YYYY-MM-DD",
+        help="only include drops on or after this date (reports only)",
+    )
+    parser.add_argument(
+        "--until",
+        type=parse_date,
+        metavar="YYYY-MM-DD",
+        help="only include drops on or before this date (reports only)",
+    )
+    parser.add_argument(
+        "--last",
+        type=parse_window,
+        metavar="7d",
+        help="only include drops from the last window, e.g. 7d or 24h (reports only)",
+    )
+
     parser.add_argument(
         "--interval",
         type=positive_int,
@@ -569,11 +755,27 @@ def main() -> None:
 
     log = CsvOutageLog(args.logfile)
 
-    if args.summary:
-        SummaryReporter().report(log.read_all())
-        return
-    if args.hourly:
-        HourlyReporter().report(log.read_all())
+    reporting = args.summary or args.hourly or args.daily or args.report
+    filtering = (
+        args.since is not None or args.until is not None or args.last is not None
+    )
+    if filtering and not reporting:
+        parser.error(
+            "--since/--until/--last only apply to a report "
+            "(--summary, --hourly, --daily or --report)"
+        )
+
+    if reporting:
+        since, until = _resolve_range(args, parser)
+        outages = filter_by_range(log.read_all(), since, until)
+        if args.summary:
+            SummaryReporter().report(outages)
+        elif args.hourly:
+            HourlyReporter().report(outages)
+        elif args.daily:
+            DailyReporter().report(outages)
+        else:  # args.report
+            ReportReporter(since, until).report(outages)
         return
 
     gateway = find_gateway()

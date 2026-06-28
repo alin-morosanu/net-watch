@@ -1,12 +1,17 @@
-"""Tests for netwatch. Run with:  pytest tests.py -v
+"""Tests for net-watch. Run with:  pytest tests.py -v
 
 No real network is touched: we feed fake samples and a fake clock.
 """
 
+import argparse
 import io
+import sys
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+import config
 import netwatch as nw
 
 
@@ -212,7 +217,7 @@ def test_flush_open_drop_returns_none_when_up():
         nw.HourlyReporter().report([outage])
     lines = out.getvalue().splitlines()
     assert "20:00  ###" in lines[22]
-    assert "  1.0 min  (1 drops)" in lines[22]
+    assert "  1.0 min  (1 drop)" in lines[22]
     assert "21:00  ##############################" in lines[23]
     # The drop is counted once, in the hour it began (20:00). Its seconds are
     # still split across both hours, so 21:00 shows the minutes but 0 drops.
@@ -329,3 +334,190 @@ def test_csv_read_normalizes_naive_timestamps(tmp_path):
     assert restored[0].start.tzinfo is not None
     assert restored[0].end.tzinfo is not None
     assert restored[0].seconds == 95
+
+
+# --- config wiring ---
+
+
+def test_version_and_defaults_come_from_config():
+    assert nw.__version__ == config.VERSION
+    assert nw.TARGETS == config.TARGETS
+    assert nw.CHECK_INTERVAL == config.CHECK_INTERVAL
+    assert nw.FAIL_THRESHOLD == config.FAIL_THRESHOLD
+    assert nw.LOG_FILE == config.LOG_FILE
+
+
+# --- date-range filtering and parsing ---
+
+
+def _outage_on(day: str, cause: str = "ISP / upstream") -> nw.Outage:
+    """A 60-second drop at noon (local time) on the given YYYY-MM-DD."""
+    start = datetime.fromisoformat(day + "T12:00:00").astimezone()
+    return nw.Outage(start, start + timedelta(seconds=60), cause)
+
+
+def test_filter_by_range_keeps_only_drops_inside_window():
+    outages = [
+        _outage_on("2026-06-01"),
+        _outage_on("2026-06-10"),
+        _outage_on("2026-06-20"),
+    ]
+    since = nw.parse_date("2026-06-05")
+    until = nw.parse_date("2026-06-15") + timedelta(days=1)  # half-open upper bound
+    kept = nw.filter_by_range(outages, since, until)
+    assert len(kept) == 1
+    assert kept[0].start.date().isoformat() == "2026-06-10"
+
+
+def test_filter_by_range_with_no_bounds_keeps_everything():
+    outages = [_outage_on("2026-06-01"), _outage_on("2026-06-20")]
+    assert nw.filter_by_range(outages, None, None) == outages
+
+
+def test_parse_window_days_hours_and_bare_number():
+    assert nw.parse_window("7d") == timedelta(days=7)
+    assert nw.parse_window("24h") == timedelta(hours=24)
+    assert nw.parse_window("30") == timedelta(days=30)  # bare number means days
+
+
+def test_parse_window_rejects_garbage():
+    with pytest.raises(argparse.ArgumentTypeError):
+        nw.parse_window("soon")
+
+
+def test_parse_date_makes_aware_midnight():
+    dt = nw.parse_date("2026-06-01")
+    assert dt.tzinfo is not None
+    assert (dt.hour, dt.minute, dt.second) == (0, 0, 0)
+
+
+def test_parse_date_rejects_bad_format():
+    with pytest.raises(argparse.ArgumentTypeError):
+        nw.parse_date("01/06/2026")
+
+
+def test_resolve_range_widens_until_to_an_inclusive_day():
+    parser = argparse.ArgumentParser()
+    args = argparse.Namespace(last=None, since=None, until=nw.parse_date("2026-06-15"))
+    since, until = nw._resolve_range(args, parser)
+    assert since is None
+    assert until == nw.parse_date("2026-06-16")
+
+
+def test_resolve_range_rejects_last_with_since():
+    parser = argparse.ArgumentParser()
+    args = argparse.Namespace(
+        last=timedelta(days=7), since=nw.parse_date("2026-06-01"), until=None
+    )
+    with pytest.raises(SystemExit):  # parser.error exits
+        nw._resolve_range(args, parser)
+
+
+# --- daily report ---
+
+
+def test_daily_report_splits_drop_across_midnight():
+    # 23:50 -> 00:10 next day: ten minutes land on each day, counted once.
+    start = datetime(2026, 6, 1, 23, 50, tzinfo=timezone.utc)
+    end = datetime(2026, 6, 2, 0, 10, tzinfo=timezone.utc)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        nw.DailyReporter().report([nw.Outage(start, end, "ISP / upstream")])
+
+    lines = [ln for ln in out.getvalue().splitlines() if ln.startswith("2026-06-0")]
+    assert len(lines) == 2
+    assert lines[0].startswith("2026-06-01")
+    assert "(1 drop)" in lines[0]  # counted on the day it began
+    assert lines[1].startswith("2026-06-02")
+    assert "(0 drops)" in lines[1]  # only spilled-over seconds, no new drop
+
+
+def test_daily_report_handles_empty():
+    out = io.StringIO()
+    with redirect_stdout(out):
+        nw.DailyReporter().report([])
+    assert "No drops logged yet." in out.getvalue()
+
+
+# --- hand-to-ISP report ---
+
+
+def test_report_reporter_shows_period_and_stats():
+    o1 = _outage_on("2026-06-10", "ISP / upstream")
+    o2 = _outage_on("2026-06-11", "local network")
+    since = nw.parse_date("2026-06-01")
+    until = nw.parse_date("2026-06-30") + timedelta(days=1)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        nw.ReportReporter(since, until).report([o1, o2])
+
+    text = out.getvalue()
+    assert "2026-06-01 to 2026-06-30" in text  # inclusive period, not the half-open end
+    assert "Likely ISP fault: 1 of 2 (50%)" in text
+    assert "Worst 2 outages:" in text
+
+
+def test_report_reporter_handles_empty_period():
+    since = nw.parse_date("2026-06-01")
+    until = nw.parse_date("2026-06-07") + timedelta(days=1)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        nw.ReportReporter(since, until).report([])
+
+    text = out.getvalue()
+    assert "2026-06-01 to 2026-06-07" in text
+    assert "No drops recorded in this period." in text
+
+
+def test_parse_window_rejects_zero_and_negative():
+    with pytest.raises(argparse.ArgumentTypeError):
+        nw.parse_window("0d")
+    with pytest.raises(argparse.ArgumentTypeError):
+        nw.parse_window("-3d")
+
+
+def test_resolve_range_rejects_since_after_until():
+    parser = argparse.ArgumentParser()
+    args = argparse.Namespace(
+        last=None, since=nw.parse_date("2026-06-20"), until=nw.parse_date("2026-06-10")
+    )
+    with pytest.raises(SystemExit):  # parser.error exits
+        nw._resolve_range(args, parser)
+
+
+def test_resolve_range_last_pins_a_concrete_upper_bound():
+    parser = argparse.ArgumentParser()
+    args = argparse.Namespace(last=timedelta(days=7), since=None, until=None)
+    since, until = nw._resolve_range(args, parser)
+    assert since is not None and until is not None
+    assert until - since == timedelta(days=7)
+
+
+def test_report_reporter_last_window_names_period_when_empty():
+    # --last resolves to (since, now); an empty report should still name the
+    # window rather than fall back to "all time".
+    parser = argparse.ArgumentParser()
+    args = argparse.Namespace(last=timedelta(days=7), since=None, until=None)
+    since, until = nw._resolve_range(args, parser)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        nw.ReportReporter(since, until).report([])
+    text = out.getvalue()
+    assert "all time" not in text
+    assert "No drops recorded in this period." in text
+
+
+def test_daily_report_survives_zero_length_outage():
+    # A hand-edited CSV can yield up_at == down_at; the chart must not crash.
+    ts = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        nw.DailyReporter().report([nw.Outage(ts, ts, "unknown")])
+    assert "Drops by day" in out.getvalue()  # printed cleanly, no exception
+
+
+def test_filter_flags_require_a_report_mode(monkeypatch):
+    # --last without a report mode is a usage error, caught before any network.
+    monkeypatch.setattr(sys, "argv", ["netwatch.py", "--last", "7d"])
+    with pytest.raises(SystemExit):
+        nw.main()
