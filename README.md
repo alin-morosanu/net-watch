@@ -2,7 +2,7 @@
 
 A command-line tool that logs every time your internet drops — so you have hard evidence when you talk to your provider.
 
-Works on **Linux**, **macOS**, and **Windows**. No extra packages needed. Pure Python 3.14+.
+Works on **Linux**, **macOS**, and **Windows**. No extra packages needed. Pure Python 3.9+.
 
 ---
 
@@ -23,7 +23,7 @@ Every logged drop also says who probably caused it:
 ```
 netwatch.py           # the main script
 tests.py              # pytest tests (no real network needed)
-net-watch.service     # systemd unit for running it on a Linux server or Raspberry Pi
+netwatch.service      # systemd unit for running it on a Linux server or Raspberry Pi
 net_outages.csv       # created automatically when the first drop is logged
 ```
 
@@ -100,6 +100,7 @@ If it is always bad at the same time of day, that chart makes the pattern very o
 | `--logfile PATH` | `net_outages.csv` | Where to write the CSV log. Use an absolute path when running as a service. |
 | `--summary` | — | Print totals and exit. |
 | `--hourly` | — | Print the hour-by-hour chart and exit. |
+| `--version` | — | Print the version and exit. |
 
 Example — check every 3 seconds, need 3 failures before believing a drop:
 
@@ -145,25 +146,25 @@ The Pi is the best place to run this. It is on all day, uses almost no power, an
 
 ```bash
 mkdir -p /home/pi/net-watch
-cp netwatch.py /home/pi/net-watch/
+cp netwatch.py netwatch.service /home/pi/net-watch/
 ```
 
 **Install as a service** (starts automatically on boot, restarts if it crashes):
 
 ```bash
-# edit net-watch.service first if your username is not "pi"
-sudo cp net-watch.service /etc/systemd/system/
+# edit netwatch.service first if your username is not "pi"
+sudo cp /home/pi/net-watch/netwatch.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now net-watch
+sudo systemctl enable --now netwatch
 ```
 
 **Useful commands:**
 
 ```bash
-sudo systemctl status net-watch     # is it running?
-journalctl -u net-watch -f          # watch the live output
-sudo systemctl stop net-watch       # stop it
-sudo systemctl disable net-watch    # stop it starting on boot
+sudo systemctl status netwatch      # is it running?
+journalctl -u netwatch -f           # watch the live output
+sudo systemctl stop netwatch        # stop it
+sudo systemctl disable netwatch     # stop it starting on boot
 ```
 
 The CSV is saved in `/home/pi/net-watch/net_outages.csv`.

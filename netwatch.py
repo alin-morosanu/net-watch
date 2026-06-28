@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import platform
+import signal
 import socket
 import subprocess
 import sys
@@ -38,6 +39,8 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
 from typing import Protocol
+
+__version__ = "0.1.0"
 
 # --- settings you can change ---
 TARGETS: list[tuple[str, int]] = [("1.1.1.1", 53), ("8.8.8.8", 53)]
@@ -317,15 +320,25 @@ class CsvOutageLog:
     def read_all(self) -> list[Outage]:
         if not self._path.exists():
             return []
+        outages: list[Outage] = []
         with self._path.open(newline="") as f:
-            return [
-                Outage(
-                    ensure_aware(datetime.fromisoformat(row["down_at"])),
-                    ensure_aware(datetime.fromisoformat(row["up_at"])),
-                    row["likely_cause"],
-                )
-                for row in csv.DictReader(f)
-            ]
+            for row in csv.DictReader(f):
+                try:
+                    outages.append(
+                        Outage(
+                            ensure_aware(datetime.fromisoformat(row["down_at"])),
+                            ensure_aware(datetime.fromisoformat(row["up_at"])),
+                            row["likely_cause"],
+                        )
+                    )
+                except (KeyError, ValueError) as exc:
+                    # A hand-edited or half-written row should not sink the
+                    # whole report. Skip it, keep the good data, say so.
+                    print(
+                        f"warning: skipping unreadable row in {self._path}: {exc}",
+                        file=sys.stderr,
+                    )
+        return outages
 
 
 class InMemoryOutageLog:
@@ -374,6 +387,10 @@ class HourlyReporter:
         secs = {h: 0.0 for h in range(24)}
         count = {h: 0 for h in range(24)}
         for o in outages:
+            # Count each drop once, in the hour it began, so the totals match
+            # the real number of outages. Seconds are still split across the
+            # hours the drop spanned, so the chart shows when downtime landed.
+            count[o.start.hour] += 1
             current = o.start
             while current < o.end:
                 next_hour = current.replace(
@@ -381,7 +398,6 @@ class HourlyReporter:
                 ) + timedelta(hours=1)
                 segment_end = min(next_hour, o.end)
                 secs[current.hour] += (segment_end - current).total_seconds()
-                count[current.hour] += 1
                 current = segment_end
         worst = max(secs.values()) or 1.0
         print("Drops by hour of day (local time):\n")
@@ -400,6 +416,12 @@ class TickResult:
     event: str  # "none" | "drop_started" | "recovered"
     outage: Outage | None = None
     at: datetime | None = None
+
+
+def _raise_keyboard_interrupt(*_: object) -> None:
+    """Signal handler: turn SIGTERM into the same KeyboardInterrupt we already
+    handle, so a service stop/restart still records an in-progress drop."""
+    raise KeyboardInterrupt
 
 
 class Monitor:
@@ -435,10 +457,18 @@ class Monitor:
         router_ok = self._router.is_reachable() if not ok else True
         transition = self._detector.update(ok, ts)
 
+        # Track router health across the current run of failures, starting at
+        # the very first failure (where the outage is timestamped), not just
+        # the tick that confirms the drop. A clean sample outside a drop
+        # resets the run so an earlier blip can't poison a later attribution.
+        if not ok:
+            self._router_ok_all = self._router_ok_all and router_ok
+        elif self._open_start is None:
+            self._router_ok_all = True
+
         if transition is not None:
             if transition.to is Connectivity.DOWN:
                 self._open_start = transition.at
-                self._router_ok_all = router_ok
                 return TickResult("drop_started", at=transition.at)
             # came back up
             assert self._open_start is not None
@@ -452,14 +482,33 @@ class Monitor:
             self._router_ok_all = True
             return TickResult("recovered", outage=outage, at=transition.at)
 
-        if self._open_start is not None and not ok:
-            self._router_ok_all = self._router_ok_all and router_ok
         return TickResult("none")
+
+    def flush_open_drop(self) -> Outage | None:
+        """Log a still-open drop (e.g. on shutdown) and return it, or None if
+        nothing was in progress. Safe to call twice: the drop is cleared once
+        logged, so a second call is a no-op."""
+        if self._open_start is None:
+            return None
+        outage = Outage(
+            self._open_start,
+            self._clock(),
+            cause_for(self._gateway, self._router_ok_all),
+        )
+        self._log.append(outage)
+        self._open_start = None
+        self._router_ok_all = True
+        return outage
 
     def run_forever(self) -> None:
         where = self._log_path.resolve() if self._log_path else "(in memory)"
         print(f"Watching on {_OS}. Router = {self._gateway or 'unknown'}.")
         print(f"Logging to {where}. Press Ctrl+C to stop.\n")
+
+        # systemd sends SIGTERM on stop/restart; treat it like Ctrl+C so an
+        # in-progress drop is still recorded before we exit.
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
         try:
             while True:
                 result = self.tick()
@@ -473,14 +522,9 @@ class Monitor:
                     )
                 time.sleep(self._interval)
         except KeyboardInterrupt:
-            if self._open_start is not None:  # still down when you stopped
-                o = Outage(
-                    self._open_start,
-                    self._clock(),
-                    cause_for(self._gateway, self._router_ok_all),
-                )
-                self._log.append(o)
-                print(f"\nLogged the in-progress drop ({o.seconds:.0f}s).")
+            outage = self.flush_open_drop()
+            if outage is not None:  # still down when you stopped
+                print(f"\nLogged the in-progress drop ({outage.seconds:.0f}s).")
             print("Stopped.")
 
 
@@ -496,6 +540,9 @@ def positive_int(value: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Log internet drops.")
+    parser.add_argument(
+        "--version", action="version", version=f"net-watch {__version__}"
+    )
     parser.add_argument("--summary", action="store_true", help="show totals and exit")
     parser.add_argument(
         "--hourly", action="store_true", help="show drops by hour and exit"

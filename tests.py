@@ -108,7 +108,99 @@ def test_monitor_blames_local_when_router_also_down():
     assert drops[0].cause == "local network"
 
 
-def test_hourly_report_splits_drop_across_hour_boundary():
+def test_monitor_uses_router_status_from_first_failure():
+    # The router is down at the FIRST failing sample but back by the sample
+    # that confirms the drop. That first reading must still count, so the
+    # blame lands on the local network.
+    internet = FakeReachability([True, False, False, True])
+    router = FakeReachability([False, True])  # down at first failure, then up
+    clock = iter(at(i * 5) for i in range(20))
+    log = nw.InMemoryOutageLog()
+
+    monitor = nw.Monitor(
+        internet,
+        router,
+        nw.DropDetector(fail_threshold=2, recover_threshold=1),
+        log,
+        gateway="192.168.1.1",
+        interval=0,
+        clock=lambda: next(clock),
+    )
+    for _ in range(4):
+        monitor.tick()
+
+    drops = log.read_all()
+    assert len(drops) == 1
+    assert drops[0].cause == "local network"
+
+
+def test_blip_with_bad_router_does_not_poison_later_drop():
+    # A single failure (with the router briefly down) is just a blip and is
+    # discarded. A real ISP drop later must NOT inherit that stale reading.
+    internet = FakeReachability([True, False, True, True, False, False, True])
+    router = FakeReachability([False, True, True])  # only read on failures
+    clock = iter(at(i * 5) for i in range(20))
+    log = nw.InMemoryOutageLog()
+
+    monitor = nw.Monitor(
+        internet,
+        router,
+        nw.DropDetector(fail_threshold=2, recover_threshold=1),
+        log,
+        gateway="192.168.1.1",
+        interval=0,
+        clock=lambda: next(clock),
+    )
+    for _ in range(7):
+        monitor.tick()
+
+    drops = log.read_all()
+    assert len(drops) == 1
+    assert drops[0].cause.startswith("ISP")
+
+
+def test_flush_open_drop_logs_in_progress_outage():
+    internet = FakeReachability([True, False, False])  # goes down and stays down
+    router = FakeReachability([True] * 10)
+    clock = iter(at(i * 5) for i in range(20))
+    log = nw.InMemoryOutageLog()
+
+    monitor = nw.Monitor(
+        internet,
+        router,
+        nw.DropDetector(fail_threshold=2, recover_threshold=1),
+        log,
+        gateway="192.168.1.1",
+        interval=0,
+        clock=lambda: next(clock),
+    )
+    for _ in range(3):
+        monitor.tick()
+    assert log.read_all() == []  # drop is open, nothing logged yet
+
+    outage = monitor.flush_open_drop()
+    assert outage is not None
+    assert outage.start == at(5)  # timed from the first failure
+    assert len(log.read_all()) == 1
+
+    # Calling it again is a no-op: the drop has been cleared.
+    assert monitor.flush_open_drop() is None
+    assert len(log.read_all()) == 1
+
+
+def test_flush_open_drop_returns_none_when_up():
+    log = nw.InMemoryOutageLog()
+    monitor = nw.Monitor(
+        FakeReachability([True]),
+        FakeReachability([True]),
+        nw.DropDetector(),
+        log,
+        gateway="192.168.1.1",
+        interval=0,
+        clock=lambda: at(0),
+    )
+    assert monitor.flush_open_drop() is None
+    assert log.read_all() == []
     out = io.StringIO()
     outage = nw.Outage(
         datetime(2025, 1, 1, 20, 59),
@@ -118,12 +210,13 @@ def test_hourly_report_splits_drop_across_hour_boundary():
 
     with redirect_stdout(out):
         nw.HourlyReporter().report([outage])
-
     lines = out.getvalue().splitlines()
     assert "20:00  ###" in lines[22]
     assert "  1.0 min  (1 drops)" in lines[22]
     assert "21:00  ##############################" in lines[23]
-    assert " 10.0 min  (1 drops)" in lines[23]
+    # The drop is counted once, in the hour it began (20:00). Its seconds are
+    # still split across both hours, so 21:00 shows the minutes but 0 drops.
+    assert " 10.0 min  (0 drops)" in lines[23]
 
 
 # --- cause attribution ---
@@ -179,6 +272,22 @@ def test_csv_log_round_trips(tmp_path):
 def test_csv_log_read_all_empty_when_missing(tmp_path):
     log = nw.CsvOutageLog(tmp_path / "nope.csv")
     assert log.read_all() == []
+
+
+def test_csv_read_skips_unreadable_rows(tmp_path, capsys):
+    path = tmp_path / "messy.csv"
+    # A good row, a corrupt row (bad dates), then another good row.
+    path.write_text(
+        "down_at,up_at,seconds,likely_cause\n"
+        "2025-06-10T20:03:12+01:00,2025-06-10T20:04:47+01:00,95.0,ISP / upstream\n"
+        "not-a-date,also-bad,oops,broken\n"
+        "2025-06-10T22:11:05+01:00,2025-06-10T22:11:22+01:00,17.0,local network\n"
+    )
+    restored = nw.CsvOutageLog(path).read_all()
+    assert len(restored) == 2  # the bad row is skipped, the good ones survive
+    assert restored[0].cause == "ISP / upstream"
+    assert restored[1].cause == "local network"
+    assert "skipping unreadable row" in capsys.readouterr().err
 
 
 # --- timezone handling ---

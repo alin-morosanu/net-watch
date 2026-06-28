@@ -12,6 +12,19 @@ ExecStart=/usr/bin/python3 /home/pi/net-watch/netwatch.py --logfile /home/pi/net
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=10
+# give the logger a moment to record an in-progress drop on stop/restart
+TimeoutStopSec=15
+
+# --- light hardening (safe defaults) ---
+# ReadWritePaths must match WorkingDirectory above if you change the paths.
+ProtectSystem=strict
+ReadWritePaths=/home/pi/net-watch
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# NoNewPrivileges=true   # only enable if your `ping` uses unprivileged ICMP
+#                          sockets; it can break a setuid/setcap ping binary.
 
 [Install]
 WantedBy=multi-user.target
