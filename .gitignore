@@ -228,9 +228,12 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,macos,python
 
+### net-watch ###
+# Local, deployment-specific command notes (kept out of the public repo)
+docs/useful-commands.local.txt
+
 # Custom rules (everything added below won't be overriden by 'Generate .gitignore File' if you use 'Update' option)
 
 # net-watch runtime output
 net_outages.csv
 *.csv
-

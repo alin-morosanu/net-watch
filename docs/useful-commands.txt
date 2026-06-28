@@ -1,0 +1,13 @@
+net-watch — useful commands
+===========================
+
+Deployment-specific operational commands (host, paths, service control,
+and report queries) live in the private operations runbook:
+
+  SECOND_BRAIN/03-RESOURCES/Home Lab/23-Net-Watch-Operations.md
+
+That runbook is the single source of truth. Deployment specifics are kept
+out of this public repository because they vary per install.
+
+My local, copy-paste-ready commands (gitignored, not committed):
+  docs/useful-commands.local.txt

@@ -26,7 +26,10 @@ config.py             # settings you can edit (targets, timing, thresholds, vers
 tests.py              # pytest tests (no real network needed)
 net-watch.service     # systemd unit for running it on a Linux server or Raspberry Pi
 net_outages.csv       # created automatically when the first drop is logged
+docs/                 # operational notes and runbook pointer
 ```
+
+For running and querying a real deployment, see [docs/](docs/).
 
 ---
 
