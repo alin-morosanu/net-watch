@@ -55,6 +55,19 @@ def now() -> datetime:
     return datetime.now().astimezone()
 
 
+def ensure_aware(dt: datetime) -> datetime:
+    """Guarantee a timezone-aware datetime.
+
+    Timestamps we create are always aware (see ``now``), but a CSV that was
+    hand-edited or written by an older build may hold a bare, naive value.
+    A naive value is read as local wall-clock time and pinned to the local
+    zone, so every Outage in memory is aware. That keeps durations correct
+    even when the recorded times straddle a DST change, because aware
+    subtraction works on the underlying instants, not the wall clock.
+    """
+    return dt if dt.tzinfo is not None else dt.astimezone()
+
+
 # =====================================================================
 #  Value object — a finished drop
 # =====================================================================
@@ -307,8 +320,8 @@ class CsvOutageLog:
         with self._path.open(newline="") as f:
             return [
                 Outage(
-                    datetime.fromisoformat(row["down_at"]),
-                    datetime.fromisoformat(row["up_at"]),
+                    ensure_aware(datetime.fromisoformat(row["down_at"])),
+                    ensure_aware(datetime.fromisoformat(row["up_at"])),
                     row["likely_cause"],
                 )
                 for row in csv.DictReader(f)

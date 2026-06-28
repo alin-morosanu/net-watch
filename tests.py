@@ -5,7 +5,7 @@ No real network is touched: we feed fake samples and a fake clock.
 
 import io
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import netwatch as nw
 
@@ -164,12 +164,14 @@ def test_hourly_report_handles_empty():
 def test_csv_log_round_trips(tmp_path):
     path = tmp_path / "outages.csv"
     log = nw.CsvOutageLog(path)
-    log.append(nw.Outage(at(0), at(95), "ISP / upstream"))
+    start = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2025, 1, 1, 12, 1, 35, tzinfo=timezone.utc)
+    log.append(nw.Outage(start, end, "ISP / upstream"))
 
     restored = nw.CsvOutageLog(path).read_all()
     assert len(restored) == 1
-    assert restored[0].start == at(0)
-    assert restored[0].end == at(95)
+    assert restored[0].start == start
+    assert restored[0].end == end
     assert restored[0].cause == "ISP / upstream"
     assert restored[0].seconds == 95
 
@@ -177,3 +179,44 @@ def test_csv_log_round_trips(tmp_path):
 def test_csv_log_read_all_empty_when_missing(tmp_path):
     log = nw.CsvOutageLog(tmp_path / "nope.csv")
     assert log.read_all() == []
+
+
+# --- timezone handling ---
+
+
+def test_duration_is_correct_across_a_dst_fall_back():
+    # 01:30 happens twice when the clocks go back: once at -04:00, once at
+    # -05:00. The real gap is one hour. Aware subtraction must see that.
+    edt = timezone(timedelta(hours=-4))
+    est = timezone(timedelta(hours=-5))
+    outage = nw.Outage(
+        datetime(2025, 11, 2, 1, 30, tzinfo=edt),
+        datetime(2025, 11, 2, 1, 30, tzinfo=est),
+        "ISP / upstream",
+    )
+    assert outage.seconds == 3600
+
+
+def test_ensure_aware_pins_naive_to_local():
+    naive = datetime(2025, 1, 1, 12, 0, 0)
+    result = nw.ensure_aware(naive)
+    assert result.tzinfo is not None
+
+
+def test_ensure_aware_leaves_aware_untouched():
+    aware = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    assert nw.ensure_aware(aware) is aware
+
+
+def test_csv_read_normalizes_naive_timestamps(tmp_path):
+    path = tmp_path / "legacy.csv"
+    # A hand-edited / older CSV with no timezone offset on the timestamps.
+    path.write_text(
+        "down_at,up_at,seconds,likely_cause\n"
+        "2025-06-10T20:03:12,2025-06-10T20:04:47,95.0,ISP / upstream\n"
+    )
+    restored = nw.CsvOutageLog(path).read_all()
+    assert len(restored) == 1
+    assert restored[0].start.tzinfo is not None
+    assert restored[0].end.tzinfo is not None
+    assert restored[0].seconds == 95
