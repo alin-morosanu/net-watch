@@ -1,0 +1,17 @@
+[Unit]
+Description=net-watch internet drop logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# change these two to match your Pi:
+User=pi
+WorkingDirectory=/home/pi/net-watch
+ExecStart=/usr/bin/python3 /home/pi/net-watch/netwatch.py --logfile /home/pi/net-watch/net_outages.csv
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
