@@ -29,7 +29,7 @@ VERSION = "0.2.0"
 TARGETS: list[tuple[str, int]] = [("1.1.1.1", 53), ("8.8.8.8", 53)]
 
 # Timing
-CHECK_INTERVAL = 3  # seconds between checks
+CHECK_INTERVAL = 5  # seconds between checks
 SOCKET_TIMEOUT = 2.0  # seconds to wait for each target
 
 # Debounce — ignore tiny one-off blips
