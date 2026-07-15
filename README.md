@@ -27,7 +27,24 @@ tests.py              # pytest tests (no real network needed)
 net-watch.service     # systemd unit for running it on a Linux server or Raspberry Pi
 net_outages.csv       # created automatically when the first drop is logged
 docs/                 # operational notes and runbook pointer
+deploy.sh             # generic Ansible deploy wrapper (see below)
 ```
+
+### Deploying with Ansible
+
+`deploy.sh` is deployment-agnostic — it takes no hardcoded paths, hosts, or
+usernames, so it's safe to keep in this public repo. Point it at your own
+Ansible project (with a `net_watch`-tagged role/play) and host:
+
+```bash
+NET_WATCH_IAC_DIR=/path/to/your/ansible/project \
+NET_WATCH_HOST=user@host \
+./deploy.sh
+```
+
+It runs a `--check --diff` dry run first, asks for confirmation before
+applying for real (skip with `--yes`), then checks the service status over
+SSH. Run `./deploy.sh --help` for all options.
 
 For running and querying a real deployment, see [docs/](docs/).
 
